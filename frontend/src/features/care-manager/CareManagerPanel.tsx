@@ -47,30 +47,57 @@ interface CareManagerPanelProps {
   turns: Turn[];
   currentTriage: TriageLevel;
   safeModeNoResult: boolean;
-  onVoiceComplete: (blob: Blob) => void;
+  onSubmitSymptom: (text: string, source: 'text' | 'voice') => void;
   isProcessing: boolean;
   places: Place[];
   pharmacyKeyMissing?: boolean;
   emergencyOverride?: boolean;  // true when place list is sourced from /api/emergency/nearby
   user:      User | null;
-  onSignIn:  () => void;
-  onSignOut: () => void;
+  authLoading: boolean;
+  onSignIn:  () => Promise<void>;
+  onSignOut: () => Promise<void>;
+  onPlaceClick: (place: Place, rank: number, source: 'panel') => void;
+  onCall119Click: () => void;
+  onRecordingStart: () => void;
+  onRecordingStop: (durationSec: number) => void;
+  ttsEnabled: boolean;
+  onToggleTts: (enabled: boolean) => void;
+  lastAssistantMessage: string | null;
+  onReplayTts: () => void;
 }
 
 export default function CareManagerPanel({
   turns,
   currentTriage,
   safeModeNoResult,
-  onVoiceComplete,
+  onSubmitSymptom,
   isProcessing,
   places,
   pharmacyKeyMissing = false,
   emergencyOverride  = false,
   user,
+  authLoading,
   onSignIn,
   onSignOut,
+  onPlaceClick,
+  onCall119Click,
+  onRecordingStart,
+  onRecordingStop,
+  ttsEnabled,
+  onToggleTts,
+  lastAssistantMessage,
+  onReplayTts,
 }: CareManagerPanelProps) {
   const [isExpanded, setIsExpanded] = useState(true);
+  const [symptomInput, setSymptomInput] = useState('');
+
+  function submitSymptom(source: 'text' | 'voice', textOverride?: string) {
+    const raw = textOverride ?? symptomInput;
+    const text = raw.trim();
+    if (!text) return;
+    setSymptomInput(text);
+    onSubmitSymptom(text, source);
+  }
 
   return (
     <div style={styles.panel}>
@@ -91,7 +118,7 @@ export default function CareManagerPanel({
         </div>
         {/* Auth chip — stops propagation so clicks don't collapse the panel */}
         <div onClick={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <UserChip user={user} onSignIn={onSignIn} onSignOut={onSignOut} />
+          <UserChip user={user} authLoading={authLoading} onSignIn={onSignIn} onSignOut={onSignOut} />
           <span style={styles.chevron}>{isExpanded ? '▾' : '▴'}</span>
         </div>
       </div>
@@ -125,6 +152,23 @@ export default function CareManagerPanel({
                     실시간 응급의료기관 정보 기준으로 표시됩니다.
                   </span>
                 )}
+                <a
+                  href="tel:119"
+                  onClick={onCall119Click}
+                  style={{
+                    display: 'inline-block',
+                    marginTop: '6px',
+                    padding: '3px 8px',
+                    borderRadius: '6px',
+                    background: '#B91C1C',
+                    color: '#fff',
+                    fontSize: '11px',
+                    fontWeight: 700,
+                    textDecoration: 'none',
+                  }}
+                >
+                  119 전화
+                </a>
               </span>
             </div>
           )}
@@ -144,6 +188,17 @@ export default function CareManagerPanel({
           )}
 
         <div style={styles.body}>
+          <div style={styles.settingsRow}>
+            <label style={styles.settingsLabel}>
+              <input
+                type="checkbox"
+                checked={ttsEnabled}
+                onChange={(e) => onToggleTts(e.target.checked)}
+              />
+              <span>음성으로 읽기</span>
+            </label>
+          </div>
+
           {/* SAFE_MODE no-result warning */}
           {safeModeNoResult && (
             <div style={styles.safeModeWarning}>
@@ -178,7 +233,13 @@ export default function CareManagerPanel({
           {!safeModeNoResult && places.length > 0 && (
             <div style={styles.placeList}>
               {places.map((place, i) => (
-                <PlaceRow key={place.id} place={place} rank={i + 1} isTop={i === 0} />
+                <PlaceRow
+                  key={place.id}
+                  place={place}
+                  rank={i + 1}
+                  isTop={i === 0}
+                  onClick={onPlaceClick}
+                />
               ))}
             </div>
           )}
@@ -196,10 +257,51 @@ export default function CareManagerPanel({
             )}
           </div>
 
+          {lastAssistantMessage && (
+            <div style={styles.assistantMessage}>
+              <strong style={{ display: 'block', marginBottom: '4px' }}>어시스턴트</strong>
+              <span>{lastAssistantMessage}</span>
+            </div>
+          )}
+
+          <div style={styles.inputRow}>
+            <input
+              value={symptomInput}
+              onChange={(e) => setSymptomInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  submitSymptom('text');
+                }
+              }}
+              placeholder="증상을 입력하세요"
+              disabled={isProcessing}
+              style={styles.input}
+            />
+            <button
+              onClick={() => submitSymptom('text')}
+              disabled={isProcessing || symptomInput.trim().length === 0}
+              style={styles.submitButton}
+            >
+              전송
+            </button>
+          </div>
+
+          {lastAssistantMessage && (
+            <button
+              onClick={onReplayTts}
+              style={styles.ttsButton}
+            >
+              안내 음성 재생
+            </button>
+          )}
+
           {/* Voice input */}
           <VoiceInput
-            onRecordingComplete={onVoiceComplete}
+            onTranscript={(text) => submitSymptom('voice', text)}
             disabled={isProcessing}
+            onRecordingStart={onRecordingStart}
+            onRecordingStop={onRecordingStop}
           />
         </div>
         </>
@@ -214,17 +316,27 @@ export default function CareManagerPanel({
 
 function UserChip({
   user,
+  authLoading,
   onSignIn,
   onSignOut,
 }: {
   user:      User | null;
-  onSignIn:  () => void;
-  onSignOut: () => void;
+  authLoading: boolean;
+  onSignIn:  () => Promise<void>;
+  onSignOut: () => Promise<void>;
 }) {
+  if (authLoading) {
+    return (
+      <span style={{ fontSize: '11px', color: '#6B7280', whiteSpace: 'nowrap' }}>
+        인증 확인중...
+      </span>
+    );
+  }
+
   if (!user) {
     return (
       <button
-        onClick={onSignIn}
+        onClick={() => { void onSignIn(); }}
         style={{
           fontSize:     '11px',
           fontWeight:   600,
@@ -238,7 +350,7 @@ function UserChip({
           lineHeight:   '1.5',
         }}
       >
-        로그인
+        Google 로그인
       </button>
     );
   }
@@ -286,7 +398,7 @@ function UserChip({
 
       {/* Logout button */}
       <button
-        onClick={onSignOut}
+        onClick={() => { void onSignOut(); }}
         title="로그아웃"
         style={{
           fontSize:     '10px',
@@ -358,7 +470,17 @@ function ReasonTag({ reason }: { reason: string }) {
   );
 }
 
-function PlaceRow({ place, rank, isTop }: { place: Place; rank: number; isTop: boolean }) {
+function PlaceRow({
+  place,
+  rank,
+  isTop,
+  onClick,
+}: {
+  place: Place;
+  rank: number;
+  isTop: boolean;
+  onClick: (place: Place, rank: number, source: 'panel') => void;
+}) {
   // OTC_STORE (convenience stores / marts) do not have reliable open-status data.
   // Show a hedged label instead of claiming OPEN/CLOSED.
   const isOtc = place.source === 'OTC_STORE';
@@ -384,7 +506,10 @@ function PlaceRow({ place, rank, isTop }: { place: Place; rank: number; isTop: b
         padding:      '10px 10px 8px',
         boxShadow:    '0 2px 8px rgba(245,158,11,0.18)',
         marginBottom: '2px',
-      }}>
+        cursor: 'pointer',
+      }}
+      onClick={() => onClick(place, rank, 'panel')}
+      >
         {/* Header row: 추천 badge + open status */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
           <span style={{
@@ -437,7 +562,16 @@ function PlaceRow({ place, rank, isTop }: { place: Place; rank: number; isTop: b
   }
 
   return (
-    <div style={{ ...styles.placeRow, background: 'transparent', border: '1px solid transparent', borderRadius: '8px' }}>
+    <div
+      onClick={() => onClick(place, rank, 'panel')}
+      style={{
+        ...styles.placeRow,
+        background: 'transparent',
+        border: '1px solid transparent',
+        borderRadius: '8px',
+        cursor: 'pointer',
+      }}
+    >
       <div style={{ ...styles.rankBadge, background: '#E3E8EF', color: '#555', fontWeight: 500 }}>
         {rank}
       </div>
@@ -537,6 +671,18 @@ const styles: Record<string, React.CSSProperties> = {
   body: {
     padding: '12px 16px 16px',
   },
+  settingsRow: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    marginBottom: '8px',
+  },
+  settingsLabel: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '11px',
+    color: '#4B5563',
+  },
   safeModeWarning: {
     fontSize:     '13px',
     color:        '#fff',
@@ -564,6 +710,40 @@ const styles: Record<string, React.CSSProperties> = {
     maxHeight:  '200px',
     overflowY:  'auto',
     marginBottom: '4px',
+  },
+  inputRow: {
+    display: 'flex',
+    gap: '6px',
+    marginBottom: '8px',
+  },
+  assistantMessage: {
+    fontSize: '12px',
+    color: '#1F2937',
+    background: '#F3F4F6',
+    border: '1px solid #E5E7EB',
+    borderRadius: '8px',
+    padding: '8px 10px',
+    lineHeight: '1.5',
+    marginBottom: '8px',
+  },
+  input: {
+    flex: 1,
+    border: '1px solid #D1D5DB',
+    borderRadius: '8px',
+    fontSize: '12px',
+    color: '#111827',
+    padding: '8px 10px',
+    outline: 'none',
+  },
+  submitButton: {
+    border: '1px solid #BFDBFE',
+    background: '#EFF6FF',
+    color: '#1E40AF',
+    borderRadius: '8px',
+    fontSize: '12px',
+    fontWeight: 600,
+    padding: '0 10px',
+    cursor: 'pointer',
   },
   emptyState: {
     fontSize:   '13px',
@@ -606,6 +786,18 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     gap:           '4px',
     marginBottom:  '10px',
+  },
+  ttsButton: {
+    width: '100%',
+    border: '1px solid #BFDBFE',
+    background: '#EFF6FF',
+    color: '#1E40AF',
+    borderRadius: '8px',
+    fontSize: '12px',
+    fontWeight: 600,
+    padding: '7px 10px',
+    cursor: 'pointer',
+    marginBottom: '8px',
   },
   placeRow: {
     display:    'flex',

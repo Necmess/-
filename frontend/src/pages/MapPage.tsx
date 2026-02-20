@@ -1,9 +1,11 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import type { Turn, TriageLevel, Place, OpenStatus } from '../types/triage';
 import { TRIAGE_COLORS } from '../constants/triage';
 import CareManagerPanel from '../features/care-manager/CareManagerPanel';
 import { useUserLocation, type LatLng } from '../hooks/useUserLocation';
 import { useAuth } from '../hooks/useAuth';
+import { getOrCreateSessionId, logEvent } from '../lib/analytics';
+import { createDefaultTtsProvider, type TtsProvider } from '../lib/voice';
 import { classifyTriage } from '../lib/triageClassifier';
 import { fetchPharmacyOpenStatus, ServiceKeyMissingError } from '../lib/apiClient';
 import { fetchNearbyEmergency, emergencyToPlace } from '../lib/emergencyClient';
@@ -26,6 +28,20 @@ function haversine(a: LatLng, b: LatLng): number {
     sinLat * sinLat +
     Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinLng * sinLng;
   return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function buildAssistantMessage(
+  triageLevel: NonNullable<TriageLevel>,
+  topPlaces: Place[],
+): string {
+  const head = triageLevel === 'RED'
+    ? '위험 신호가 감지되었습니다.'
+    : triageLevel === 'AMBER'
+    ? '의료기관 방문이 권장됩니다.'
+    : '자가 관리가 가능한 수준으로 보입니다.';
+  const top = topPlaces[0];
+  if (!top) return `${head} 화면의 안내를 확인해 주세요.`;
+  return `${head} 가장 적합한 곳은 ${top.name}이며 거리 ${top.distance_km.toFixed(2)}km입니다.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,9 +146,17 @@ export default function MapPage() {
   const [places, setPlaces] = useState<Place[]>(MOCK_PLACES);
   const [safeModeNoResult, setSafeModeNoResult] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(true);
+  const [lastAssistantMessage, setLastAssistantMessage] = useState<string | null>(null);
+  const [lastAssistantTriage, setLastAssistantTriage] = useState<TriageLevel>(null);
 
   const { latLng, status: geoStatus, errorMsg: geoError } = useUserLocation();
-  const { user, signInWithGoogle, signOut } = useAuth();
+  const { user, loading: authLoading, signInWithGoogle, signOut } = useAuth();
+  const sessionIdRef = useRef(getOrCreateSessionId());
+  const ttsProviderRef = useRef<TtsProvider>(createDefaultTtsProvider());
+  const hasLoggedAppOpenRef = useRef(false);
+  const hasLoggedGeoGrantedRef = useRef(false);
+  const prevUserIdRef = useRef<string | null>(null);
 
   // Pharmacy open-status enrichment keyed by place.name.
   // Updated asynchronously; does not affect ranking order.
@@ -147,6 +171,44 @@ export default function MapPage() {
   // Hospital/clinic candidates from /api/hospitals/nearby.
   // When non-empty, these replace the HOSPITAL entries from MOCK_PLACES.
   const [apiHospitals, setApiHospitals] = useState<Place[]>([]);
+
+  useEffect(() => {
+    if (hasLoggedAppOpenRef.current) return;
+    hasLoggedAppOpenRef.current = true;
+    void logEvent(
+      'app_open',
+      { path: window.location.pathname },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }, [user?.id]);
+
+  useEffect(() => {
+    const currentUserId = user?.id ?? null;
+    if (!prevUserIdRef.current && currentUserId) {
+      void logEvent(
+        'login_success',
+        { provider: 'google' },
+        { userId: currentUserId, sessionId: sessionIdRef.current },
+      );
+    }
+    prevUserIdRef.current = currentUserId;
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (geoStatus !== 'granted' || hasLoggedGeoGrantedRef.current || !latLng) return;
+    hasLoggedGeoGrantedRef.current = true;
+    void logEvent(
+      'location_permission_granted',
+      { lat: latLng.lat, lng: latLng.lng },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }, [geoStatus, latLng, user?.id]);
+
+  useEffect(() => {
+    return () => {
+      ttsProviderRef.current.stop();
+    };
+  }, []);
 
   // Merge API hospital candidates with non-hospital mock entries.
   // When the API call hasn't returned yet, falls back to full MOCK_PLACES.
@@ -294,41 +356,125 @@ export default function MapPage() {
     );
   }, [currentTriage, emergencyPlaces, rankedPlaces, pharmacyStatus]);
 
-  // Stub handler — wired to real POST /voice-turn in next phase
-  function handleVoiceComplete(_blob: Blob) {
+  function handleSymptomSubmit(transcript: string, source: 'text' | 'voice') {
+    const trimmed = transcript.trim();
+    if (!trimmed) return;
+
     setIsProcessing(true);
 
-    // Step 1: immediately show a pending turn with recognising placeholder
     const turnId = crypto.randomUUID();
     const pendingTurn: Turn = {
       turn_id:          turnId,
-      transcript:       '목소리 인식 중...',
+      transcript:       trimmed,
       triage_level:     null,
       top5_places:      [],
       tts_audio_url:    null,
       safe_mode_result: { applied: false, no_result: false },
     };
     setTurns(prev => [...prev, pendingTurn]);
+    void logEvent(
+      'symptom_submit',
+      { source, turn_id: turnId, transcript_length: trimmed.length },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
 
-    // Step 2: after 1 s, resolve with mock transcript and classified triage
     setTimeout(() => {
-      const mockTranscript = '머리가 아파요';
-      const triageLevel    = classifyTriage(mockTranscript);
+      const triageLevel = classifyTriage(trimmed);
+      const top5 = rankPlaces(MOCK_PLACES, triageLevel).slice(0, 5);
 
       const resolvedTurn: Turn = {
         turn_id:          turnId,
-        transcript:       mockTranscript,
+        transcript:       trimmed,
         triage_level:     triageLevel,
-        top5_places:      MOCK_PLACES,
+        top5_places:      top5,
         tts_audio_url:    null,
         safe_mode_result: { applied: false, no_result: false },
       };
       setTurns(prev => prev.map(t => t.turn_id === turnId ? resolvedTurn : t));
       setCurrentTriage(triageLevel);
-      setPlaces(MOCK_PLACES);
+      setPlaces(top5);
       setSafeModeNoResult(false);
       setIsProcessing(false);
-    }, 1000);
+      const assistantMessage = buildAssistantMessage(triageLevel, top5);
+      setLastAssistantMessage(assistantMessage);
+      setLastAssistantTriage(triageLevel);
+      void logEvent(
+        'triage_result',
+        { turn_id: turnId, triage_level: triageLevel, transcript_length: trimmed.length },
+        { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+      );
+      void logEvent(
+        'top5_shown',
+        {
+          turn_id: turnId,
+          triage_level: triageLevel,
+          place_ids: top5.map(p => p.id),
+          place_sources: top5.map(p => p.source),
+        },
+        { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+      );
+      if (ttsEnabled) {
+        playTts(assistantMessage, triageLevel);
+      }
+    }, 700);
+  }
+
+  function handlePlaceClick(place: Place, rank: number, source: 'panel' | 'map') {
+    void logEvent(
+      'place_click',
+      {
+        place_id: place.id,
+        place_name: place.name,
+        place_source: place.source,
+        rank,
+        ui_source: source,
+      },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }
+
+  function handleCall119Click() {
+    void logEvent(
+      'call_119_click',
+      { triage_level: currentTriage },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }
+
+  function handleRecordingStart() {
+    void logEvent(
+      'stt_record_start',
+      {},
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }
+
+  function handleRecordingStop(durationSec: number) {
+    void logEvent(
+      'stt_record_stop',
+      { duration_sec: durationSec },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }
+
+  function playTts(message: string, triageLevel: TriageLevel) {
+    ttsProviderRef.current.speak(message, {
+      lang: 'ko-KR',
+      onError: (errMsg) => {
+        console.error('[tts]', errMsg);
+      },
+    });
+
+    void logEvent(
+      'tts_play',
+      { message_length: message.length, triage_level: triageLevel },
+      { userId: user?.id ?? null, sessionId: sessionIdRef.current },
+    );
+  }
+
+  function handleReplayTts() {
+    if (!lastAssistantMessage) return;
+    playTts(lastAssistantMessage, lastAssistantTriage);
   }
 
   return (
@@ -356,7 +502,13 @@ export default function MapPage() {
 
         {/* Mock place markers — driven by displayPlaces (enriched open status) */}
         {!safeModeNoResult && displayPlaces.map((place, i) => (
-          <MockMarker key={place.id} place={place} rank={i + 1} isTop={i === 0} />
+          <MockMarker
+            key={place.id}
+            place={place}
+            rank={i + 1}
+            isTop={i === 0}
+            onPlaceClick={handlePlaceClick}
+          />
         ))}
       </div>
 
@@ -368,14 +520,23 @@ export default function MapPage() {
         turns={turns}
         currentTriage={currentTriage}
         safeModeNoResult={safeModeNoResult}
-        onVoiceComplete={handleVoiceComplete}
+        onSubmitSymptom={handleSymptomSubmit}
         isProcessing={isProcessing}
         places={displayPlaces}
         pharmacyKeyMissing={pharmacyKeyMissing}
         emergencyOverride={currentTriage === 'RED' && emergencyPlaces.length > 0}
         user={user}
+        authLoading={authLoading}
         onSignIn={signInWithGoogle}
         onSignOut={signOut}
+        onPlaceClick={handlePlaceClick}
+        onCall119Click={handleCall119Click}
+        onRecordingStart={handleRecordingStart}
+        onRecordingStop={handleRecordingStop}
+        ttsEnabled={ttsEnabled}
+        onToggleTts={setTtsEnabled}
+        lastAssistantMessage={lastAssistantMessage}
+        onReplayTts={handleReplayTts}
       />
     </div>
   );
@@ -422,9 +583,10 @@ interface MockMarkerProps {
   place:  Place;
   rank:   number;
   isTop:  boolean;
+  onPlaceClick: (place: Place, rank: number, source: 'panel' | 'map') => void;
 }
 
-function MockMarker({ place, rank, isTop }: MockMarkerProps) {
+function MockMarker({ place, rank, isTop, onPlaceClick }: MockMarkerProps) {
   const [hovered, setHovered] = useState(false);
 
   const dotColor =
@@ -446,6 +608,7 @@ function MockMarker({ place, rank, isTop }: MockMarkerProps) {
         left: `${15 + rank * 13}%`,
         zIndex: isTop ? 10 : 1,
       }}
+      onClick={() => onPlaceClick(place, rank, 'map')}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >

@@ -1,72 +1,66 @@
 import { useState, useRef, useEffect } from 'react';
+import { createDefaultSttProvider, type SttProvider } from '../../lib/voice';
 
 interface VoiceInputProps {
-  onRecordingComplete: (blob: Blob) => void;
+  onTranscript: (transcript: string) => void;
   disabled?: boolean;
+  onRecordingStart?: () => void;
+  onRecordingStop?: (durationSec: number) => void;
 }
 
 type RecordingState = 'idle' | 'recording';
 
-export default function VoiceInput({ onRecordingComplete, disabled = false }: VoiceInputProps) {
-  const [state,   setState]   = useState<RecordingState>('idle');
-  const [elapsed, setElapsed] = useState(0);
-  const [micErr,  setMicErr]  = useState<string | null>(null);
+export default function VoiceInput({
+  onTranscript,
+  disabled = false,
+  onRecordingStart,
+  onRecordingStop,
+}: VoiceInputProps) {
+  const [state, setState] = useState<RecordingState>('idle');
+  const [micErr, setMicErr] = useState<string | null>(null);
+  const [caption, setCaption] = useState('');
+  const finalTranscriptRef = useRef('');
+  const sttProviderRef = useRef<SttProvider>(createDefaultSttProvider());
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef        = useRef<BlobPart[]>([]);
-  const timerRef         = useRef<ReturnType<typeof setInterval> | null>(null);
-  const streamRef        = useRef<MediaStream | null>(null);
-
-  // Release mic and timer on unmount
   useEffect(() => {
     return () => {
-      clearTimer();
-      streamRef.current?.getTracks().forEach(t => t.stop());
+      sttProviderRef.current.abort();
     };
   }, []);
 
-  function clearTimer() {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-  }
-
-  async function startRecording() {
+  function startRecording() {
     setMicErr(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const mr = new MediaRecorder(stream);
-      mediaRecorderRef.current = mr;
-      chunksRef.current = [];
-
-      mr.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      mr.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType || 'audio/webm' });
-        onRecordingComplete(blob);
-        stream.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
-      };
-
-      mr.start();
-      setState('recording');
-      setElapsed(0);
-      timerRef.current = setInterval(() => setElapsed(s => s + 1), 1000);
-    } catch {
-      setMicErr('마이크 접근 권한이 필요합니다.');
+    if (!sttProviderRef.current.isSupported()) {
+      setMicErr('이 브라우저는 음성 인식(Web Speech API)을 지원하지 않습니다. Chrome을 사용해 주세요.');
+      return;
     }
+    finalTranscriptRef.current = '';
+    sttProviderRef.current.start({
+      lang: 'ko-KR',
+      onStart: () => {
+        setState('recording');
+        setCaption('');
+        onRecordingStart?.();
+      },
+      onPartialTranscript: (text) => {
+        setCaption((finalTranscriptRef.current || text).trim());
+      },
+      onFinalTranscript: (text) => {
+        finalTranscriptRef.current = text;
+        setCaption(text);
+      },
+      onStop: (durationSec) => {
+        setState('idle');
+        onRecordingStop?.(durationSec);
+        const finalText = finalTranscriptRef.current.trim();
+        if (finalText) onTranscript(finalText);
+      },
+      onError: (message) => setMicErr(message),
+    });
   }
 
   function stopRecording() {
-    clearTimer();
-    mediaRecorderRef.current?.stop();
-    setState('idle');
-    setElapsed(0);
+    sttProviderRef.current.stop();
   }
 
   function handleClick() {
@@ -76,7 +70,6 @@ export default function VoiceInput({ onRecordingComplete, disabled = false }: Vo
   }
 
   const isRecording = state === 'recording';
-  const elapsedLabel = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
 
   return (
     <div style={styles.wrapper}>
@@ -99,17 +92,18 @@ export default function VoiceInput({ onRecordingComplete, disabled = false }: Vo
 
       {/* Elapsed timer — only visible while recording */}
       {isRecording && (
-        <span style={styles.elapsed}>{elapsedLabel}</span>
+        <span style={styles.elapsed}>듣는 중...</span>
       )}
 
       <span style={styles.label}>
         {disabled
           ? '처리 중...'
           : isRecording
-          ? '말씀하세요 — 탭하여 중지'
+          ? '듣는 중... 탭하여 중지'
           : '탭하여 증상 말하기'}
       </span>
 
+      {caption && <span style={styles.caption}>{caption}</span>}
       {micErr && <span style={styles.micError}>{micErr}</span>}
     </div>
   );
@@ -152,11 +146,10 @@ const styles: Record<string, React.CSSProperties> = {
     flexShrink:     0,
   },
   elapsed: {
-    fontSize:    '15px',
+    fontSize:    '13px',
     fontWeight:  600,
     color:       '#F44336',
-    letterSpacing: '1px',
-    fontVariantNumeric: 'tabular-nums',
+    letterSpacing: '0.3px',
   },
   label: {
     fontSize:   '12px',
@@ -168,5 +161,14 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize:  '11px',
     color:     '#F44336',
     textAlign: 'center',
+  },
+  caption: {
+    fontSize: '11px',
+    color: '#374151',
+    textAlign: 'center',
+    maxWidth: '240px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
   },
 };
