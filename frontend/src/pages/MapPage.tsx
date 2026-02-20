@@ -414,13 +414,15 @@ export default function MapPage() {
     const region = regionRef?.q0 && regionRef?.q1
       ? { q0: regionRef.q0, q1: regionRef.q1 }
       : parseAddressRegion(regionRef?.address_road, regionRef?.address_jibun ?? regionRef?.address);
+    const q0ForRequest = region.q0 ?? '서울특별시';
+    const q1ForRequest = region.q1 ?? '종로구';
 
     void postVoiceTurn({
       transcript: trimmed,
       lat: latLng?.lat,
       lng: latLng?.lng,
-      q0: region.q0 ?? undefined,
-      q1: region.q1 ?? undefined,
+      q0: q0ForRequest,
+      q1: q1ForRequest,
     })
       .then((resp) => {
         const resolvedTurn: Turn = {

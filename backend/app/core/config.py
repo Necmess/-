@@ -32,6 +32,9 @@ class Settings(BaseSettings):
         return v
 
     # Place search
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
     PLACES_CSV_PATH:  str   = "data/medical_places.csv"
     SEARCH_RADIUS_KM: float = 3.0
 
