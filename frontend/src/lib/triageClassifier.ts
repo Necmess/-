@@ -1,51 +1,109 @@
 import type { TriageLevel } from '../types/triage';
 
-// ---------------------------------------------------------------------------
-// Keyword lists — ordered from most specific to most general within each tier.
-// Evaluation order: RED → AMBER → GREEN (first match wins).
-// Mirrors the rule_triage.py contract on the backend.
-// ---------------------------------------------------------------------------
+type Level = NonNullable<TriageLevel>;
 
-const RED_KEYWORDS: string[] = [
-  // Respiratory / airway
-  '호흡곤란', '숨이 안', '숨을 못', '숨막혀', '숨막',
-  // Cardiac / chest
-  '가슴 통증', '가슴통증', '가슴이 아파', '심정지', '심장이 멈',
-  // Neurological
-  '의식이 없', '의식을 잃', '쓰러졌', '쓰러져', '실신', '쓰러',
-  '마비', '뇌졸중', '중풍', '경련', '발작',
-  // Severe bleeding
-  '심한 출혈', '피를 많이', '피가 많이',
-  // Explicit emergency
-  '응급',
+interface Rule {
+  code: string;
+  level: 'RED' | 'AMBER';
+  weight: number;
+  keywords: string[];
+}
+
+const TRIAGE_RULES: Rule[] = [
+  {
+    code: 'TRAUMA_AMPUTATION',
+    level: 'RED',
+    weight: 5,
+    keywords: ['덜렁', '덜렁거리', '절단', '잘렸', '뼈가 보', '관절이 빠졌'],
+  },
+  {
+    code: 'RESP_SEVERE',
+    level: 'RED',
+    weight: 4,
+    keywords: ['호흡곤란', '숨이 안', '숨을 못', '숨막혀', '숨막'],
+  },
+  {
+    code: 'NEURO_SEVERE',
+    level: 'RED',
+    weight: 4,
+    keywords: ['의식', '실신', '경련', '마비', '발작', '쓰러졌', '쓰러져'],
+  },
+  {
+    code: 'BLEEDING_SEVERE',
+    level: 'RED',
+    weight: 4,
+    keywords: ['심한 출혈', '피를 많이', '피가 많이'],
+  },
+  {
+    code: 'CARDIAC_ALERT',
+    level: 'RED',
+    weight: 4,
+    keywords: ['가슴 통증', '가슴통증', '압박', '심정지', '심장이 멈'],
+  },
+  {
+    code: 'FEVER_HIGH',
+    level: 'AMBER',
+    weight: 2,
+    keywords: ['열', '고열', '발열', '38도', '39도', '40도'],
+  },
+  {
+    code: 'GI_DISTRESS',
+    level: 'AMBER',
+    weight: 2,
+    keywords: ['복통', '구토', '설사', '메스꺼', '구역질'],
+  },
+  {
+    code: 'PAIN_NON_SPECIFIC',
+    level: 'AMBER',
+    weight: 1,
+    keywords: ['통증', '두통', '머리 아파', '머리가 아파', '몸살'],
+  },
+  {
+    code: 'DIZZINESS',
+    level: 'AMBER',
+    weight: 2,
+    keywords: ['어지러', '어지럽', '현기증'],
+  },
+  {
+    code: 'MSK_INJURY',
+    level: 'AMBER',
+    weight: 2,
+    keywords: ['골절', '부러졌', '부러져', '삐었', '염좌', '붓기'],
+  },
 ];
 
-const AMBER_KEYWORDS: string[] = [
-  // Head / pain
-  '머리가 아파', '머리 아파', '두통', '편두통',
-  // Fever
-  '열이 나', '고열', '발열', '38도', '39도', '40도',
-  // GI
-  '구토', '구역질', '메스꺼', '복통', '배가 아파', '배 아파', '배아파', '설사',
-  // Dizziness
-  '어지럽', '어지러', '현기증',
-  // Respiratory (mild)
-  '기침이 심', '목이 아파', '목 아파',
-  // Musculoskeletal
-  '삐었', '삐어', '염좌', '골절', '부러졌', '부러져',
-  // Chest (non-specific, lower priority than RED phrases)
-  '가슴이 답답', '가슴 답답',
-];
+const HARD_RED_CODES = new Set([
+  'TRAUMA_AMPUTATION',
+  'RESP_SEVERE',
+  'NEURO_SEVERE',
+  'BLEEDING_SEVERE',
+  'CARDIAC_ALERT',
+]);
 
-// ---------------------------------------------------------------------------
-// classifyTriage
-// Returns the first tier whose any keyword appears in the normalised transcript.
-// Falls back to GREEN when no keyword matches.
-// ---------------------------------------------------------------------------
-export function classifyTriage(transcript: string): NonNullable<TriageLevel> {
+export function classifyTriageDetailed(transcript: string): {
+  triage: Level;
+  reasonCodes: string[];
+} {
   const text = transcript.trim().toLowerCase();
+  const score = { RED: 0, AMBER: 0 };
+  const reasonCodes: string[] = [];
 
-  if (RED_KEYWORDS.some(kw => text.includes(kw.toLowerCase()))) return 'RED';
-  if (AMBER_KEYWORDS.some(kw => text.includes(kw.toLowerCase()))) return 'AMBER';
-  return 'GREEN';
+  for (const rule of TRIAGE_RULES) {
+    if (rule.keywords.some((kw) => text.includes(kw.toLowerCase()))) {
+      reasonCodes.push(rule.code);
+      score[rule.level] += rule.weight;
+    }
+  }
+
+  if (reasonCodes.some((code) => HARD_RED_CODES.has(code)) || score.RED >= 4) {
+    return { triage: 'RED', reasonCodes };
+  }
+  if (score.AMBER > 0) {
+    return { triage: 'AMBER', reasonCodes };
+  }
+  return { triage: 'GREEN', reasonCodes };
+}
+
+export function classifyTriage(transcript: string): Level {
+  return classifyTriageDetailed(transcript).triage;
 }

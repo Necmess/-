@@ -6,7 +6,7 @@ import { useUserLocation, type LatLng } from '../hooks/useUserLocation';
 import { useAuth } from '../hooks/useAuth';
 import { getOrCreateSessionId, logEvent } from '../lib/analytics';
 import { createDefaultTtsProvider, type TtsProvider } from '../lib/voice';
-import { classifyTriage } from '../lib/triageClassifier';
+import { classifyTriage, classifyTriageDetailed } from '../lib/triageClassifier';
 import { postVoiceTurn } from '../lib/voiceTurnClient';
 import { fetchPharmacyOpenStatus, ServiceKeyMissingError } from '../lib/apiClient';
 import { fetchNearbyEmergency, emergencyToPlace } from '../lib/emergencyClient';
@@ -429,6 +429,7 @@ export default function MapPage() {
           turn_id: resp.turn_id,
           transcript: resp.transcript,
           triage_level: resp.triage_level,
+          triage_reason_codes: resp.triage_reason_codes,
           top5_places: resp.top5_places,
           tts_audio_url: resp.tts_audio_url,
           safe_mode_result: resp.safe_mode_result,
@@ -438,11 +439,13 @@ export default function MapPage() {
       .catch(() => {
         // Backend unavailable: keep app usable with local fallback.
         const triageLevel = classifyTriage(trimmed);
+        const detailed = classifyTriageDetailed(trimmed);
         const top5 = rankPlaces(MOCK_PLACES, triageLevel).slice(0, 5);
         const resolvedTurn: Turn = {
           turn_id: turnId,
           transcript: trimmed,
-          triage_level: triageLevel,
+          triage_level: detailed.triage,
+          triage_reason_codes: detailed.reasonCodes,
           top5_places: top5,
           tts_audio_url: null,
           safe_mode_result: { applied: false, no_result: false },

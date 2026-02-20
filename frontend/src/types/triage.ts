@@ -48,6 +48,7 @@ export interface Turn {
   turn_id: string;
   transcript: string;
   triage_level: TriageLevel;
+  triage_reason_codes?: string[];
   top5_places: Place[];
   tts_audio_url: string | null;
   safe_mode_result: SafeModeResult;

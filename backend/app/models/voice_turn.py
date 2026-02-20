@@ -40,6 +40,7 @@ class VoiceTurnResponse(BaseModel):
     turn_id: str
     transcript: str
     triage_level: TriageLevel
+    triage_reason_codes: list[str] = []
     top5_places: list[VoiceTurnPlace]
     tts_audio_url: Optional[str] = None
     safe_mode_result: SafeModeResult
