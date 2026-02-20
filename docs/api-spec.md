@@ -1,161 +1,120 @@
-# API Specification — AI Care Manager MVP
+# API Specification (Current)
 
 ## Base URL
 
+```txt
+http://localhost:8000
 ```
-http://localhost:8000        (local dev)
-https://api.<domain>.com     (production)
-```
-
-All endpoints require a valid Supabase JWT in the `Authorization: Bearer <token>` header, verified by `middleware/auth.py`.
 
 ---
 
-## Endpoints
+## Health
 
-### POST /voice-turn
+### GET `/health`
 
-Processes one voice turn: STT → triage → place ranking → TTS.
+Response:
 
-**Request**
-
-```
-Content-Type: multipart/form-data
-
-Fields:
-  audio_file   file     Raw audio blob (webm/mp4/wav)
-  session_id   string   UUID of the active session
-  lat          float    User's current latitude
-  lng          float    User's current longitude
+```json
+{ "status": "ok" }
 ```
 
-**Response 200**
+---
+
+## Voice Turn
+
+### POST `/api/voice-turn`
+
+현재 프론트(STT 결과 텍스트) 기준 통합 엔드포인트.
+
+Request (`application/json`):
 
 ```json
 {
-  "turn_id":       "uuid",
-  "transcript":    "string — STT output",
-  "triage_level":  "GREEN | AMBER | RED",
+  "transcript": "가슴이 답답하고 숨이 차요",
+  "lat": 37.57,
+  "lng": 126.98,
+  "q0": "서울특별시",
+  "q1": "종로구"
+}
+```
+
+Notes:
+- `transcript`는 필수
+- `lat/lng/q0/q1`는 선택(없으면 fallback 추천 사용)
+
+Response 200:
+
+```json
+{
+  "turn_id": "uuid",
+  "transcript": "가슴이 답답하고 숨이 차요",
+  "triage_level": "RED",
   "top5_places": [
     {
-      "id":                "string",
-      "name":              "string",
-      "category":          "string",
-      "address":           "string",
-      "lat":               0.0,
-      "lng":               0.0,
-      "distance_km":       0.0,
-      "open_status":       "OPEN | CLOSED | UNKNOWN",
-      "suitability_score": 0.0,
-      "final_score":       0.0,
-      "safe_mode_applied": false
+      "id": "string",
+      "name": "string",
+      "source": "EMERGENCY",
+      "category": "emergency_room",
+      "address": "string",
+      "lat": 0,
+      "lng": 0,
+      "distance_km": 0,
+      "open_status": "OPEN",
+      "suitability_score": 0,
+      "final_score": 0,
+      "safe_mode_applied": false,
+      "rank_reason": "증상 적합"
     }
   ],
-  "tts_audio_url": "string | null",
+  "tts_audio_url": null,
   "safe_mode_result": {
-    "applied":   false,
+    "applied": false,
     "no_result": false
-  }
+  },
+  "assistant_message": "위험 신호가 감지되었습니다..."
 }
 ```
 
-**Response — STT failure**
-
-```json
-{ "error": "stt_failed" }
-```
-HTTP 422. Pipeline stops. No triage or ranking is performed.
-
-**Response — SAFE_MODE empty result (RED triage)**
-
-```json
-{
-  "turn_id":       "uuid",
-  "transcript":    "string",
-  "triage_level":  "RED",
-  "top5_places":   [],
-  "tts_audio_url": "string | null",
-  "safe_mode_result": {
-    "applied":   true,
-    "no_result": true
-  }
-}
-```
-HTTP 200. Frontend is responsible for showing the no-result warning state.
-
-**Notes**
-
-- LLM triage failure silently falls back to rule-based triage. Response contract is identical.
-- Open status failure sets `open_status: "UNKNOWN"` per place. Pipeline continues.
-- TTS failure sets `tts_audio_url: null`. Full response is still returned.
-- AI response (via TTS) describes risk level and recommended action only. It does not diagnose.
+Error:
+- 422: `transcript` 비어 있음
 
 ---
 
-### POST /event
+## Nearby APIs
 
-Appends a single funnel analytics event. Fire-and-forget from the frontend.
+### GET `/api/hospitals/nearby`
 
-**Request**
+Query:
+- `lat` (required)
+- `lng` (required)
+- `q0` (required)
+- `q1` (optional)
+- `radius_km` (default 5, max 20)
+- `limit` (default 20, max 50)
 
-```
-Content-Type: application/json
+### GET `/api/emergency/nearby`
 
-{
-  "session_id":  "uuid",
-  "turn_id":     "uuid | null",
-  "event_type":  "string",
-  "payload":     {}
-}
-```
+Query:
+- `lat` (required)
+- `lng` (required)
+- `q0` (required)
+- `q1` (optional)
+- `radius_km` (default 10, max 50)
+- `limit` (default 10, max 30)
 
-**Allowed `event_type` values**
+### GET `/api/pharmacy/open-status`
 
-| Value | Fired when |
-|-------|-----------|
-| `voice_start` | User begins recording |
-| `stt_done` | Transcript received |
-| `triage_done` | Triage level assigned |
-| `place_ranked` | Top5 list returned |
-| `tts_played` | Audio playback started |
-| `error` | Any pipeline error |
-
-**Response 200**
-
-```json
-{ "event_id": "uuid" }
-```
-
-**Notes**
-
-- Frontend should not await this call before rendering results.
-- `turn_id` is null for events fired before `/voice-turn` returns.
-- No validation on `payload` shape — flexible jsonb storage.
+Query:
+- `q0` (required)
+- `q1` (required)
+- `names` (required, comma-separated)
+- `q1_fallback` (optional)
+- `now` (optional, HHMM)
+- `holiday` (optional, bool)
 
 ---
 
-## Auth Flow
+## Config Notes
 
-```
-Frontend (Supabase Google OAuth)
-  → receives JWT
-  → attaches as Authorization: Bearer <token> on every request
-
-Backend (middleware/auth.py)
-  → verifies JWT with Supabase public key
-  → injects user_id into request context
-  → 401 if missing or invalid
-```
-
-Session creation (`sessions` table row) is handled server-side on the first `/voice-turn` call if no active session exists for the user.
-
----
-
-## Error Codes
-
-| HTTP | Condition |
-|------|-----------|
-| 200 | Success (including SAFE_MODE empty result) |
-| 401 | Missing or invalid JWT |
-| 422 | STT failure (pipeline cannot proceed) |
-| 500 | Unexpected server error |
+- `DATA_GO_KR_SERVICE_KEY` 미설정 시 일부 엔드포인트가 `503` 반환
+- 프론트는 `VITE_API_BASE_URL`로 백엔드 주소를 지정

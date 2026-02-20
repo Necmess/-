@@ -1,18 +1,18 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 import type { Turn, TriageLevel, Place, OpenStatus } from '../types/triage';
-import { TRIAGE_COLORS } from '../constants/triage';
 import CareManagerPanel from '../features/care-manager/CareManagerPanel';
+import LeafletMap from '../components/LeafletMap';
 import { useUserLocation, type LatLng } from '../hooks/useUserLocation';
 import { useAuth } from '../hooks/useAuth';
 import { getOrCreateSessionId, logEvent } from '../lib/analytics';
 import { createDefaultTtsProvider, type TtsProvider } from '../lib/voice';
 import { classifyTriage } from '../lib/triageClassifier';
+import { postVoiceTurn } from '../lib/voiceTurnClient';
 import { fetchPharmacyOpenStatus, ServiceKeyMissingError } from '../lib/apiClient';
 import { fetchNearbyEmergency, emergencyToPlace } from '../lib/emergencyClient';
 import { fetchNearbyHospitals, hospitalToPlace } from '../lib/hospitalClient';
 import { parseAddressRegion } from '../lib/addressParser';
 import { rankPlaces } from '../lib/rankingEngine';
-import { SOURCE_LABELS } from '../constants/places';
 
 // ---------------------------------------------------------------------------
 // Haversine — returns distance in km between two lat/lng points
@@ -378,35 +378,27 @@ export default function MapPage() {
       { userId: user?.id ?? null, sessionId: sessionIdRef.current },
     );
 
-    setTimeout(() => {
-      const triageLevel = classifyTriage(trimmed);
-      const top5 = rankPlaces(MOCK_PLACES, triageLevel).slice(0, 5);
-
-      const resolvedTurn: Turn = {
-        turn_id:          turnId,
-        transcript:       trimmed,
-        triage_level:     triageLevel,
-        top5_places:      top5,
-        tts_audio_url:    null,
-        safe_mode_result: { applied: false, no_result: false },
-      };
+    const applyTurnResult = (resolvedTurn: Turn, assistantMessage?: string) => {
+      const triageLevel = resolvedTurn.triage_level ?? classifyTriage(trimmed);
+      const resultTurnId = resolvedTurn.turn_id || turnId;
+      const top5 = resolvedTurn.top5_places;
       setTurns(prev => prev.map(t => t.turn_id === turnId ? resolvedTurn : t));
       setCurrentTriage(triageLevel);
       setPlaces(top5);
-      setSafeModeNoResult(false);
+      setSafeModeNoResult(resolvedTurn.safe_mode_result.no_result);
       setIsProcessing(false);
-      const assistantMessage = buildAssistantMessage(triageLevel, top5);
-      setLastAssistantMessage(assistantMessage);
+      const spokenMessage = assistantMessage ?? buildAssistantMessage(triageLevel, top5);
+      setLastAssistantMessage(spokenMessage);
       setLastAssistantTriage(triageLevel);
       void logEvent(
         'triage_result',
-        { turn_id: turnId, triage_level: triageLevel, transcript_length: trimmed.length },
+        { turn_id: resultTurnId, triage_level: triageLevel, transcript_length: trimmed.length },
         { userId: user?.id ?? null, sessionId: sessionIdRef.current },
       );
       void logEvent(
         'top5_shown',
         {
-          turn_id: turnId,
+          turn_id: resultTurnId,
           triage_level: triageLevel,
           place_ids: top5.map(p => p.id),
           place_sources: top5.map(p => p.source),
@@ -414,9 +406,47 @@ export default function MapPage() {
         { userId: user?.id ?? null, sessionId: sessionIdRef.current },
       );
       if (ttsEnabled) {
-        playTts(assistantMessage, triageLevel);
+        playTts(spokenMessage, triageLevel);
       }
-    }, 700);
+    };
+
+    const regionRef = places[0] ?? MOCK_PLACES[0];
+    const region = regionRef?.q0 && regionRef?.q1
+      ? { q0: regionRef.q0, q1: regionRef.q1 }
+      : parseAddressRegion(regionRef?.address_road, regionRef?.address_jibun ?? regionRef?.address);
+
+    void postVoiceTurn({
+      transcript: trimmed,
+      lat: latLng?.lat,
+      lng: latLng?.lng,
+      q0: region.q0 ?? undefined,
+      q1: region.q1 ?? undefined,
+    })
+      .then((resp) => {
+        const resolvedTurn: Turn = {
+          turn_id: resp.turn_id,
+          transcript: resp.transcript,
+          triage_level: resp.triage_level,
+          top5_places: resp.top5_places,
+          tts_audio_url: resp.tts_audio_url,
+          safe_mode_result: resp.safe_mode_result,
+        };
+        applyTurnResult(resolvedTurn, resp.assistant_message);
+      })
+      .catch(() => {
+        // Backend unavailable: keep app usable with local fallback.
+        const triageLevel = classifyTriage(trimmed);
+        const top5 = rankPlaces(MOCK_PLACES, triageLevel).slice(0, 5);
+        const resolvedTurn: Turn = {
+          turn_id: turnId,
+          transcript: trimmed,
+          triage_level: triageLevel,
+          top5_places: top5,
+          tts_audio_url: null,
+          safe_mode_result: { applied: false, no_result: false },
+        };
+        applyTurnResult(resolvedTurn);
+      });
   }
 
   function handlePlaceClick(place: Place, rank: number, source: 'panel' | 'map') {
@@ -479,37 +509,19 @@ export default function MapPage() {
 
   return (
     <div style={styles.root}>
-      <style>{`
-        @keyframes pulse {
-          0%   { transform: translate(-50%, -50%) scale(1);   opacity: 0.6; }
-          100% { transform: translate(-50%, -50%) scale(2.4); opacity: 0; }
-        }
-      `}</style>
-
-      {/* Map placeholder — Naver Map SDK mounts here in next phase.
-          latLng is passed so the SDK call can center on user position. */}
       <div style={styles.mapContainer}>
-        <span style={styles.mapLabel}>
+        <LeafletMap
+          center={latLng}
+          places={safeModeNoResult ? [] : displayPlaces}
+          onPlaceClick={handlePlaceClick}
+        />
+        <div style={styles.mapStatus}>
           {geoStatus === 'granted' && latLng
             ? `현재 위치 기준 (${latLng.lat.toFixed(4)}, ${latLng.lng.toFixed(4)})`
             : geoStatus === 'pending'
             ? '위치 확인 중...'
-            : '지도 영역 (Naver Map)'}
-        </span>
-
-        {/* My Location marker — centered in placeholder, visible once granted */}
-        {geoStatus === 'granted' && latLng && <MyLocationMarker />}
-
-        {/* Mock place markers — driven by displayPlaces (enriched open status) */}
-        {!safeModeNoResult && displayPlaces.map((place, i) => (
-          <MockMarker
-            key={place.id}
-            place={place}
-            rank={i + 1}
-            isTop={i === 0}
-            onPlaceClick={handlePlaceClick}
-          />
-        ))}
+            : 'OpenStreetMap 기반 지도'}
+        </div>
       </div>
 
       {/* Geolocation error banner — sits just above the Care Manager panel */}
@@ -543,20 +555,6 @@ export default function MapPage() {
 }
 
 // ---------------------------------------------------------------------------
-// MyLocationMarker — pulsing blue dot, centered in map placeholder.
-// In Naver Map phase: replaced by a naver.maps.Marker at latLng coords.
-// ---------------------------------------------------------------------------
-function MyLocationMarker() {
-  return (
-    <div style={styles.myLocationWrapper}>
-      <div style={styles.myLocationPulse} />
-      <div style={styles.myLocationDot} />
-      <span style={styles.myLocationLabel}>내 위치</span>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // GeoBanner — error/denial notice anchored above the Care Manager panel
 // ---------------------------------------------------------------------------
 function GeoBanner({ message }: { message: string }) {
@@ -577,104 +575,6 @@ function GeoBanner({ message }: { message: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// MockMarker — visual stand-in for real Naver map overlays
-// ---------------------------------------------------------------------------
-interface MockMarkerProps {
-  place:  Place;
-  rank:   number;
-  isTop:  boolean;
-  onPlaceClick: (place: Place, rank: number, source: 'panel' | 'map') => void;
-}
-
-function MockMarker({ place, rank, isTop, onPlaceClick }: MockMarkerProps) {
-  const [hovered, setHovered] = useState(false);
-
-  const dotColor =
-    place.open_status === 'OPEN'    ? '#4CAF50' :
-    place.open_status === 'CLOSED'  ? '#F44336' :
-                                      '#FF9800';
-
-  const pinColor = place.safe_mode_applied
-    ? TRIAGE_COLORS['RED']
-    : isTop
-    ? '#F59E0B'   // gold for rank #1
-    : '#1976D2';
-
-  return (
-    <div
-      style={{
-        ...styles.marker,
-        top:  `${20 + rank * 11}%`,
-        left: `${15 + rank * 13}%`,
-        zIndex: isTop ? 10 : 1,
-      }}
-      onClick={() => onPlaceClick(place, rank, 'map')}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
-      {/* Rank #1: animated halo ring */}
-      {isTop && <div style={styles.topHalo} />}
-
-      {/* Rank #1: star crown above pin */}
-      {isTop && (
-        <div style={{
-          position:   'absolute',
-          top:        '-18px',
-          left:       '50%',
-          transform:  'translateX(-50%)',
-          fontSize:   '14px',
-          lineHeight: 1,
-          filter:     'drop-shadow(0 1px 2px rgba(0,0,0,0.3))',
-        }}>
-          ★
-        </div>
-      )}
-
-      {/* Rank pin */}
-      <div
-        style={{
-          ...styles.markerPin,
-          background: pinColor,
-          width:      isTop ? '42px' : '28px',
-          height:     isTop ? '42px' : '28px',
-          fontSize:   isTop ? '15px' : '11px',
-          fontWeight: isTop ? 800    : 700,
-          boxShadow:  isTop
-            ? '0 0 0 4px rgba(245,158,11,0.3), 0 4px 14px rgba(0,0,0,0.3)'
-            : '0 2px 6px rgba(0,0,0,0.2)',
-        }}
-      >
-        {rank}
-      </div>
-
-      {/* Open status dot */}
-      <div style={{ ...styles.statusDot, background: dotColor }} />
-
-      {/* Tooltip on hover */}
-      {hovered && (
-        <div style={styles.tooltip}>
-          {isTop && (
-            <span style={styles.tooltipTopBadge}>★ 추천</span>
-          )}
-          <strong>{place.name}</strong>
-          <span style={{ color: '#AAA', fontSize: '10px' }}>{SOURCE_LABELS[place.source]}</span>
-          <span>{place.distance_km.toFixed(2)} km</span>
-          <span style={{ color: dotColor }}>
-            {place.open_status === 'OPEN'   ? '영업 중' :
-             place.open_status === 'CLOSED' ? '영업 종료' : '확인 불가'}
-          </span>
-          {place.rank_reason && (
-            <span style={{ color: '#0369A1', fontWeight: 600, fontSize: '11px' }}>
-              {place.rank_reason}
-            </span>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
 const styles: Record<string, React.CSSProperties> = {
@@ -690,9 +590,18 @@ const styles: Record<string, React.CSSProperties> = {
     height:     '100%',
     background: 'linear-gradient(160deg, #E8F4FD 0%, #D6EAF8 100%)',
     position:   'relative',
-    display:    'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
+  },
+  mapStatus: {
+    position: 'absolute',
+    top: '12px',
+    left: '12px',
+    background: 'rgba(255,255,255,0.92)',
+    border: '1px solid #E5E7EB',
+    borderRadius: '8px',
+    padding: '6px 10px',
+    fontSize: '12px',
+    color: '#475569',
+    zIndex: 700,
   },
   mapLabel: {
     color:      '#90A4AE',
